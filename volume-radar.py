@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serial multi-chain volume radar using GeckoTerminal and DEX Screener."""
+"""Serial multi-chain volume radar using GeckoTerminal, DexPaprika and DEX Screener."""
 
 import argparse
 import html
@@ -64,7 +64,7 @@ def parse_mapping(value, defaults):
     return mapping
 
 
-CHAINS = parse_csv(os.environ.get("VOLUME_CHAINS", "bsc,base,eth,arbitrum"))
+CHAINS = parse_csv(os.environ.get("VOLUME_CHAINS", "bsc,robinhood,ethereum"))
 TOP_N = max(1, env_int("VOLUME_TOP_N", 25))
 MAX_TREND_PAGES = max(1, min(10, env_int("MAX_TREND_PAGES", 10)))
 TREND_DURATION = os.environ.get("VOLUME_TREND_DURATION", "1h").strip().lower()
@@ -78,6 +78,11 @@ CYCLE_COOLDOWN_SECONDS = max(0, env_int("CYCLE_COOLDOWN_SECONDS", 180))
 # Eight/minute leaves margin for jitter and other tools sharing the VPS IP.
 GECKO_MIN_INTERVAL = max(6.0, env_float("GECKO_MIN_INTERVAL_SECONDS", 7.5))
 DEX_MIN_INTERVAL = max(0.2, env_float("DEX_MIN_INTERVAL_SECONDS", 1.0))
+DEXPAPRIKA_API_KEY = os.environ.get("DEXPAPRIKA_API_KEY", "").strip()
+DEXPAPRIKA_MIN_INTERVAL = max(
+    2.1 if DEXPAPRIKA_API_KEY else 4.1,
+    env_float("DEXPAPRIKA_MIN_INTERVAL_SECONDS", 2.1 if DEXPAPRIKA_API_KEY else 4.1),
+)
 HTTP_TIMEOUT = max(5, env_int("HTTP_TIMEOUT_SECONDS", 25))
 INCLUDE_UNKNOWN_MARKET_CAP = os.environ.get(
     "INCLUDE_UNKNOWN_MARKET_CAP", "0"
@@ -125,7 +130,12 @@ DEX_CHAINS = parse_mapping(
         "scroll": "scroll",
         "zksync": "zksync",
         "sonic": "sonic",
+        "robinhood": "robinhood",
     },
+)
+DEXPAPRIKA_NETWORKS = parse_mapping(
+    os.environ.get("DEXPAPRIKA_NETWORK_MAP", ""),
+    {"robinhood": "robinhood"},
 )
 
 STOCK_SYMBOLS = {
@@ -149,6 +159,7 @@ LOCATION = os.environ.get("RADAR_LOCATION", "Pemangkat").strip()
 
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 DEX_BASE = "https://api.dexscreener.com"
+DEXPAPRIKA_BASE = "https://api.dexpaprika.com"
 GECKO_ACCEPT = "application/json;version=20230302"
 
 
@@ -170,11 +181,21 @@ class RateGate:
 
 GECKO_GATE = RateGate(GECKO_MIN_INTERVAL, "GeckoTerminal")
 DEX_GATE = RateGate(DEX_MIN_INTERVAL, "DEX Screener")
+DEXPAPRIKA_GATE = RateGate(DEXPAPRIKA_MIN_INTERVAL, "DexPaprika")
 
 
 def request_json(url, provider):
-    gate = GECKO_GATE if provider == "GeckoTerminal" else DEX_GATE
-    headers = {"Accept": GECKO_ACCEPT if provider == "GeckoTerminal" else "application/json"}
+    if provider == "GeckoTerminal":
+        gate = GECKO_GATE
+        headers = {"Accept": GECKO_ACCEPT}
+    elif provider == "DexPaprika":
+        gate = DEXPAPRIKA_GATE
+        headers = {"Accept": "application/json"}
+        if DEXPAPRIKA_API_KEY:
+            headers["Authorization"] = DEXPAPRIKA_API_KEY
+    else:
+        gate = DEX_GATE
+        headers = {"Accept": "application/json"}
     for attempt in range(2):
         gate.wait()
         req = urllib.request.Request(url, headers=headers)
@@ -247,6 +268,9 @@ def is_stock_token(token):
 
 
 def fetch_trending_candidates(chain):
+    if chain in DEXPAPRIKA_NETWORKS:
+        return fetch_dexpaprika_candidates(chain)
+
     network = GECKO_NETWORKS.get(chain)
     if not network:
         print(f"[{chain}] skip: GECKO_NETWORK_MAP belum punya mapping")
@@ -311,6 +335,115 @@ def fetch_trending_candidates(chain):
 
     print(f"[{chain}] trending pages={pages}, unique eligible before MC={len(candidates)}")
     return candidates[:TOP_N]
+
+
+def fetch_dexpaprika_candidates(chain):
+    """Use DexPaprika's network-wide token ranking for Robinhood discovery."""
+    network = DEXPAPRIKA_NETWORKS.get(chain)
+    if not network:
+        print(f"[{chain}] skip: DEXPAPRIKA_NETWORK_MAP belum punya mapping")
+        return []
+
+    query = urllib.parse.urlencode({
+        "order_by": "volume_usd_24h",
+        "sort": "desc",
+        "limit": TOP_N,
+        "detailed": "true",
+    })
+    url = f"{DEXPAPRIKA_BASE}/networks/{urllib.parse.quote(network, safe='')}/tokens/search?{query}"
+    try:
+        payload = request_json(url, "DexPaprika")
+    except RuntimeError as exc:
+        print(f"[{chain}] DexPaprika trending gagal: {exc}")
+        return []
+
+    rows = payload.get("results", []) if isinstance(payload, dict) else []
+    candidates = []
+    seen_tokens = set()
+    for row in rows:
+        address = str(row.get("address") or row.get("id") or "").strip()
+        if not address or address.lower() in seen_tokens:
+            continue
+        seen_tokens.add(address.lower())
+        one_hour = row.get("1h") or (row.get("summary") or {}).get("1h") or {}
+        one_hour_value = one_hour.get("volume_usd")
+        candidates.append({
+            "chain": chain,
+            "network": network,
+            "address": address,
+            "symbol": str(row.get("symbol") or "?").strip(),
+            "name": str(row.get("name") or "").strip(),
+            "pool_address": "",
+            "pool_name": "",
+            "market_cap": None,
+            "market_cap_source": "",
+            "liquidity": as_positive_float(row.get("liquidity_usd")) or 0,
+            "volume_15m": 0,
+            "volume_1h": as_positive_float(one_hour_value) or 0,
+            "volume_1h_prefiltered": one_hour_value is not None,
+            "volume_metrics_loaded": False,
+            "volume_source": "DexPaprika",
+            "volume_24h_rank": as_positive_float(row.get("volume_usd_24h")) or 0,
+            "tx_buys_15m": int(one_hour.get("buys") or 0),
+            "tx_sells_15m": int(one_hour.get("sells") or 0),
+            "trend_rank": len(candidates) + 1,
+            "sampled_at": int(time.time()),
+        })
+        if len(candidates) >= TOP_N:
+            break
+
+    print(f"[{chain}] DexPaprika ranked tokens={len(candidates)} (volume 24h)")
+    return candidates
+
+
+def fetch_dexpaprika_volume_metrics(chain, candidates):
+    """Fetch exact 15m/1h token-wide USD totals only for cap-eligible candidates that could alert."""
+    network = DEXPAPRIKA_NETWORKS.get(chain)
+    if not network:
+        return
+
+    checked = 0
+    for candidate in candidates:
+        if is_stock_token(candidate) or not market_cap_eligible(candidate):
+            continue
+        # A 15m volume cannot exceed the enclosing 1h total. Skip detail calls
+        # for tokens whose 1h total is below both alert thresholds.
+        if (
+            candidate.get("volume_1h_prefiltered")
+            and candidate["volume_1h"] < min(MIN_VOLUME_15M, MIN_VOLUME_1H)
+        ):
+            candidate["volume_metrics_loaded"] = True
+            continue
+
+        url = (
+            f"{DEXPAPRIKA_BASE}/networks/{urllib.parse.quote(network, safe='')}"
+            f"/tokens/{urllib.parse.quote(candidate['address'], safe='')}"
+        )
+        try:
+            detail = request_json(url, "DexPaprika")
+        except RuntimeError as exc:
+            candidate["volume_metrics_error"] = str(exc)
+            print(f"[{chain}] volume detail gagal {candidate['address']}: {exc}")
+            if "HTTP 402" in str(exc) or "HTTP 403" in str(exc) or "HTTP 429" in str(exc):
+                print(f"[{chain}] hentikan detail DexPaprika sementara karena limit/akses API")
+                break
+            continue
+
+        summary = detail.get("summary") or {}
+        metric_15m = summary.get("15m") or {}
+        metric_1h = summary.get("1h") or {}
+        candidate["volume_15m"] = as_positive_float(metric_15m.get("volume_usd")) or 0
+        candidate["volume_1h"] = as_positive_float(metric_1h.get("volume_usd")) or 0
+        candidate["volume_1h_prefiltered"] = True
+        candidate["tx_buys_15m"] = int(metric_15m.get("buys") or 0)
+        candidate["tx_sells_15m"] = int(metric_15m.get("sells") or 0)
+        candidate["liquidity"] = as_positive_float(summary.get("liquidity_usd")) or candidate["liquidity"]
+        candidate["symbol"] = str(detail.get("symbol") or candidate["symbol"] or "?").strip()
+        candidate["name"] = str(detail.get("name") or candidate["name"] or "").strip()
+        candidate["volume_metrics_loaded"] = True
+        checked += 1
+
+    print(f"[{chain}] DexPaprika exact volume details={checked}")
 
 
 def dexscreener_market_caps(chain, candidates):
@@ -478,7 +611,8 @@ def build_report(matches, cycle_time):
     lines.extend([
         "<b>RULE</b>",
         "Alert jika volume 15M ATAU 1H memenuhi minimum.",
-        "Volume berdasarkan pool trending GeckoTerminal; MC diverifikasi melalui DEX Screener bila data GeckoTerminal kosong.",
+        "Volume Robinhood dari agregat token DexPaprika; chain lain dari pool trending GeckoTerminal.",
+        "Market cap diverifikasi melalui DEX Screener bila sumber utama tidak menyediakannya.",
         "",
         "Volume besar bukan jaminan aman untuk LP.",
     ])
@@ -539,15 +673,30 @@ def run_cycle(state):
         raise RuntimeError("VOLUME_TREND_DURATION harus salah satu: 5m,1h,6h,24h")
 
     all_matches = []
-    totals = {"candidates": 0, "eligible": 0, "unknown_mc": 0, "over_cap": 0, "under_min": 0}
+    totals = {
+        "candidates": 0,
+        "eligible": 0,
+        "unknown_mc": 0,
+        "over_cap": 0,
+        "under_min": 0,
+        "volume_data_skipped": 0,
+    }
     for chain in CHAINS:
-        print(f"\n[{chain}] ambil top {TOP_N} trending pools, serial")
+        source = "DexPaprika" if chain in DEXPAPRIKA_NETWORKS else "GeckoTerminal"
+        print(f"\n[{chain}] ambil top {TOP_N} kandidat via {source}, serial")
         candidates = fetch_trending_candidates(chain)
         totals["candidates"] += len(candidates)
         dexscreener_market_caps(chain, candidates)
+        if chain in DEXPAPRIKA_NETWORKS:
+            fetch_dexpaprika_volume_metrics(chain, candidates)
 
         chain_matches = []
         for candidate in candidates:
+            if is_stock_token(candidate):
+                continue
+            if not candidate.get("volume_metrics_loaded", True):
+                totals["volume_data_skipped"] += 1
+                continue
             if candidate["market_cap"] is None:
                 totals["unknown_mc"] += 1
                 if not INCLUDE_UNKNOWN_MARKET_CAP:
@@ -599,6 +748,7 @@ def run_cycle(state):
         f"candidates({totals['candidates']}) eligible({totals['eligible']}) "
         f"unknown_mc({totals['unknown_mc']}) over_max({totals['over_cap']}) "
         f"under_min({totals['under_min']}) matches({len(all_matches)}) "
+        f"volume_data_skipped({totals['volume_data_skipped']}) "
         f"alerts({len(send_matches)}) duration({finished - cycle_started}s)"
     )
     return finished
@@ -612,7 +762,7 @@ def print_credit():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Serial GeckoTerminal/DEX Screener volume radar")
+    parser = argparse.ArgumentParser(description="Serial GeckoTerminal/DexPaprika/DEX Screener volume radar")
     parser.add_argument("--once", action="store_true", help="jalankan satu siklus lalu keluar")
     args = parser.parse_args()
     state = load_state()
