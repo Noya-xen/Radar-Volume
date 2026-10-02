@@ -1,0 +1,17 @@
+[Unit]
+Description=Serial Multi-Chain Volume Radar
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/gmgn-Base-BSC/volume-radar
+EnvironmentFile=-/home/ubuntu/gmgn-Base-BSC/volume-radar/volume.env
+ExecStart=/usr/bin/python3 /home/ubuntu/gmgn-Base-BSC/volume-radar/volume-radar.py
+Restart=always
+RestartSec=20
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
